@@ -1,17 +1,9 @@
-Minimum bazel version: **6.0.0** (6.1.0 if using blzmod)
+Minimum bazel version: **7.0.0**
 
 If you're using `bzlmod`, add the following to `MODULE.bazel`:
 
 ```starlark
-bazel_dep(name = "toolchains_llvm", version = "{tag}")
-
-# To directly use a commit from GitHub, replace commit with the commit you want.
-# Otherwise, omit this block.
-git_override(
-  module_name = "toolchains_llvm",
-  commit = "{commit}",
-  remote = "https://github.com/grailbio/bazel-toolchain",
-)
+bazel_dep(name = "toolchains_llvm", version = "{version}")
 
 # Configure and register the toolchain.
 llvm = use_extension("@toolchains_llvm//toolchain/extensions:llvm.bzl", "llvm")
@@ -25,6 +17,15 @@ use_repo(llvm, "llvm_toolchain")
 register_toolchains("@llvm_toolchain//:all")
 ```
 
+To directly use a commit from GitHub, add this block and replace commit with the commit you want.
+```starlark
+git_override(
+  module_name = "toolchains_llvm",
+  commit = "{commit}",
+  remote = "https://github.com/bazel-contrib/toolchains_llvm",
+)
+```
+
 If not using `bzlmod`, include this section in your `WORKSPACE`:
 
 ```starlark
@@ -35,7 +36,7 @@ http_archive(
     sha256 = "{sha}",
     strip_prefix = "{prefix}",
     canonical_id = "{tag}",
-    url = "https://github.com/grailbio/bazel-toolchain/releases/download/{tag}/{archive}",
+    url = "https://github.com/bazel-contrib/toolchains_llvm/releases/download/{tag}/{archive}",
 )
 
 load("@toolchains_llvm//toolchain:deps.bzl", "bazel_toolchain_dependencies")
@@ -52,20 +53,4 @@ llvm_toolchain(
 load("@llvm_toolchain//:toolchains.bzl", "llvm_register_toolchains")
 
 llvm_register_toolchains()
-```
-
-And add the following section to your .bazelrc file:
-
-```sh
-# Not needed after https://github.com/bazelbuild/bazel/issues/7260 is closed
-build --incompatible_enable_cc_toolchain_resolution
-
-# For macOS only:
-
-# Needed for Bazel versions before 7.
-# Without this, one can use `--linkopt='-undefined dynamic_lookup'`.
-# This feature is intentionally not supported on macOS.
-build --features=-supports_dynamic_linker
-# Not needed after https://github.com/grailbio/bazel-toolchain/pull/229.
-build --features=-libtool
 ```

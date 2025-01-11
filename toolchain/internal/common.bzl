@@ -12,29 +12,65 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-SUPPORTED_TARGETS = [("linux", "x86_64"), ("linux", "aarch64"), ("darwin", "x86_64"), ("darwin", "aarch64")]
-
-toolchain_tools = [
-    "clang-cpp",
-    "ld.lld",
-    "llvm-ar",
-    "llvm-dwp",
-    "llvm-profdata",
-    "llvm-cov",
-    "llvm-nm",
-    "llvm-objcopy",
-    "llvm-objdump",
-    "llvm-strip",
+SUPPORTED_TARGETS = [
+    ("linux", "x86_64"),
+    ("linux", "aarch64"),
+    ("darwin", "x86_64"),
+    ("darwin", "aarch64"),
+    ("none", "wasm32"),
+    ("none", "wasm64"),
 ]
 
-def host_os_key(rctx):
+# Map of tool name to its symlinked name in the tools directory.
+# See tool_paths in toolchain/cc_toolchain_config.bzl.
+_toolchain_tools = {
+    name: name
+    for name in [
+        "clang-cpp",
+        "ld.lld",
+        "llvm-ar",
+        "llvm-dwp",
+        "llvm-profdata",
+        "llvm-cov",
+        "llvm-nm",
+        "llvm-objcopy",
+        "llvm-objdump",
+        "llvm-strip",
+    ]
+}
+
+# Extra tools for Darwin.
+_toolchain_tools_darwin = {
+    # rules_foreign_cc relies on the filename of the linker to set flags.
+    # Also see archive_flags in cc_toolchain_config.bzl.
+    # https://github.com/bazelbuild/rules_foreign_cc/blob/5547abc63b12c521113208eea0c5d7f66ba494d4/foreign_cc/built_tools/make_build.bzl#L71
+    # https://github.com/bazelbuild/rules_foreign_cc/blob/5547abc63b12c521113208eea0c5d7f66ba494d4/foreign_cc/private/cmake_script.bzl#L319
+    "llvm-libtool-darwin": "libtool",
+}
+
+def exec_os_key(rctx):
     (os, version, arch) = os_version_arch(rctx)
     if version == "":
         return "%s-%s" % (os, arch)
     else:
         return "%s-%s-%s" % (os, version, arch)
 
-_known_distros = ["freebsd", "suse", "ubuntu", "arch", "manjaro", "debian", "fedora", "centos", "amzn", "raspbian", "pop", "rhel"]
+_known_distros = [
+    "freebsd",
+    "suse",
+    "ubuntu",
+    "arch",
+    "manjaro",
+    "debian",
+    "fedora",
+    "centos",
+    "amzn",
+    "raspbian",
+    "pop",
+    "rhel",
+    "ol",
+    "almalinux",
+]
 
 def _linux_dist(rctx):
     info = {}
@@ -46,7 +82,7 @@ def _linux_dist(rctx):
 
     distname = info["ID"].strip('\"')
 
-    if distname not in _known_distros:
+    if distname not in _known_distros and "ID_LIKE" in info:
         for distro in info["ID_LIKE"].strip('\"').split(" "):
             if distro in _known_distros:
                 distname = distro
@@ -55,6 +91,8 @@ def _linux_dist(rctx):
     version = ""
     if "VERSION_ID" in info:
         version = info["VERSION_ID"].strip('"')
+    elif "VERSION_CODENAME" in info:
+        version = info["VERSION_CODENAME"].strip('"')
 
     return distname, version
 
@@ -62,7 +100,7 @@ def os_version_arch(rctx):
     _os = os(rctx)
     _arch = arch(rctx)
 
-    if _os == "linux":
+    if _os == "linux" and not rctx.attr.exec_os:
         (distname, version) = _linux_dist(rctx)
         return distname, version, _arch
 
@@ -71,6 +109,15 @@ def os_version_arch(rctx):
 def os(rctx):
     # Less granular host OS name, e.g. linux.
 
+    name = rctx.attr.exec_os
+    if name:
+        if name in ("linux", "darwin"):
+            return name
+        else:
+            fail("Unsupported value for exec_os: %s" % name)
+    return os_from_rctx(rctx)
+
+def os_from_rctx(rctx):
     name = rctx.os.name
     if name == "linux":
         return "linux"
@@ -82,9 +129,20 @@ def os(rctx):
 
 def os_bzl(os):
     # Return the OS string as used in bazel platform constraints.
-    return {"darwin": "osx", "linux": "linux"}[os]
+    return {"darwin": "osx", "linux": "linux", "none": "none"}[os]
 
 def arch(rctx):
+    arch = rctx.attr.exec_arch
+    if arch:
+        if arch in ("arm64", "aarch64"):
+            return "aarch64"
+        elif arch in ("amd64", "x86_64"):
+            return "x86_64"
+        else:
+            fail("Unsupported value for exec_arch: %s" % arch)
+    return arch_from_rctx(rctx)
+
+def arch_from_rctx(rctx):
     arch = rctx.os.arch
     if arch == "arm64":
         return "aarch64"
@@ -92,7 +150,12 @@ def arch(rctx):
         return "x86_64"
     return arch
 
+def is_standalone_arch(os, arch):
+    return os == "none" and arch in ["wasm32", "wasm64"]
+
 def os_arch_pair(os, arch):
+    if is_standalone_arch(os, arch):
+        return arch
     return "{}-{}".format(os, arch)
 
 _supported_os_arch = [os_arch_pair(os, arch) for (os, arch) in SUPPORTED_TARGETS]
@@ -108,14 +171,14 @@ def check_os_arch_keys(keys):
                 keys = ", ".join(_supported_os_arch),
             ))
 
-def host_os_arch_dict_value(rctx, attr_name, debug = False):
+def exec_os_arch_dict_value(rctx, attr_name, debug = False):
     # Gets a value from a dictionary keyed by host OS and arch.
     # Checks for the more specific key, then the less specific,
     # and finally the empty key as fallback.
     # Returns a tuple of the matching key and value.
 
     d = getattr(rctx.attr, attr_name)
-    key1 = host_os_key(rctx)
+    key1 = exec_os_key(rctx)
     if key1 in d:
         return (key1, d.get(key1))
 
@@ -133,6 +196,9 @@ def canonical_dir_path(path):
     if not path.endswith("/"):
         return path + "/"
     return path
+
+def is_absolute_path(val):
+    return val and val[0] == "/" and (len(val) == 1 or val[1] != "/")
 
 def pkg_name_from_label(label):
     if label.workspace_name:
@@ -176,31 +242,8 @@ def attr_dict(attr):
 
     return dict(tuples)
 
-def _get_host_tool_info(rctx, tool_path, tool_key = None):
-    if tool_key == None:
-        tool_key = tool_path
-
-    if tool_path == None or not rctx.path(tool_path).exists:
-        return {}
-
-    return {
-        tool_key: struct(
-            path = tool_path,
-            features = [],
-        ),
-    }
-
-def _extract_tool_path(tool_info):
-    # Have to support structs or dicts:
-    return tool_info.path if type(tool_info) == "struct" else tool_info["path"]
-
-def _get_host_tool(host_tool_info, tool_key):
-    if tool_key in host_tool_info:
-        return _extract_tool_path(host_tool_info[tool_key])
-    else:
-        return None
-
-host_tools = struct(
-    get_tool_info = _get_host_tool_info,
-    get_and_assert = _get_host_tool,
-)
+def toolchain_tools(os):
+    tools = dict(_toolchain_tools)
+    if os == "darwin":
+        tools.update(_toolchain_tools_darwin)
+    return tools

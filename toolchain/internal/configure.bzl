@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+load("@bazel_skylib//lib:paths.bzl", "paths")
 load(
     "//toolchain:aliases.bzl",
     _aliased_libs = "aliased_libs",
@@ -20,14 +21,17 @@ load(
 load(
     "//toolchain/internal:common.bzl",
     _arch = "arch",
+    _arch_from_rctx = "arch_from_rctx",
     _canonical_dir_path = "canonical_dir_path",
     _check_os_arch_keys = "check_os_arch_keys",
-    _host_os_arch_dict_value = "host_os_arch_dict_value",
-    _host_tools = "host_tools",
+    _exec_os_arch_dict_value = "exec_os_arch_dict_value",
+    _is_absolute_path = "is_absolute_path",
+    _is_standalone_arch = "is_standalone_arch",
     _list_to_string = "list_to_string",
     _os = "os",
     _os_arch_pair = "os_arch_pair",
     _os_bzl = "os_bzl",
+    _os_from_rctx = "os_from_rctx",
     _pkg_path_from_label = "pkg_path_from_label",
     _supported_targets = "SUPPORTED_TARGETS",
     _toolchain_tools = "toolchain_tools",
@@ -42,37 +46,49 @@ load(
 # workspace builds, there is never a @@ in labels.
 BZLMOD_ENABLED = "@@" in str(Label("//:unused"))
 
-def llvm_config_impl(rctx):
-    _check_os_arch_keys(rctx.attr.sysroot)
-    _check_os_arch_keys(rctx.attr.cxx_builtin_include_directories)
-
-    os = _os(rctx)
-    if os == "windows":
-        rctx.file("BUILD.bazel")
-        rctx.file("toolchains.bzl", """\
+def _empty_repository(rctx):
+    rctx.file("BUILD.bazel")
+    rctx.file("toolchains.bzl", """\
 def llvm_register_toolchains():
     pass
 """)
+
+def _join(path1, path2):
+    if path1:
+        return paths.join(path1, path2.lstrip("/"))
+    else:
+        return path2
+
+def llvm_config_impl(rctx):
+    _check_os_arch_keys(rctx.attr.sysroot)
+    _check_os_arch_keys(rctx.attr.cxx_builtin_include_directories)
+    _check_os_arch_keys(rctx.attr.extra_exec_compatible_with)
+    _check_os_arch_keys(rctx.attr.extra_target_compatible_with)
+
+    os = _os(rctx)
+    if os == "windows":
+        _empty_repository(rctx)
         return
     arch = _arch(rctx)
 
     if not rctx.attr.toolchain_roots:
-        toolchain_root = "@@%s_llvm//" % rctx.attr.name if BZLMOD_ENABLED else "@%s_llvm//" % rctx.attr.name
+        toolchain_root = ("@" if BZLMOD_ENABLED else "") + "@%s_llvm//" % rctx.attr.name
     else:
-        (_key, toolchain_root) = _host_os_arch_dict_value(rctx, "toolchain_roots")
+        (_key, toolchain_root) = _exec_os_arch_dict_value(rctx, "toolchain_roots")
 
     if not toolchain_root:
         fail("LLVM toolchain root missing for ({}, {})".format(os, arch))
-    (_key, llvm_version) = _host_os_arch_dict_value(rctx, "llvm_versions")
+    (_key, llvm_version) = _exec_os_arch_dict_value(rctx, "llvm_versions")
     if not llvm_version:
-        fail("LLVM version string missing for ({}, {})".format(os, arch))
-
+        # LLVM version missing for (os, arch)
+        _empty_repository(rctx)
+        return
     use_absolute_paths_llvm = rctx.attr.absolute_paths
     use_absolute_paths_sysroot = use_absolute_paths_llvm
 
     # Check if the toolchain root is a system path.
     system_llvm = False
-    if toolchain_root[0] == "/" and (len(toolchain_root) == 1 or toolchain_root[1] != "/"):
+    if _is_absolute_path(toolchain_root):
         use_absolute_paths_llvm = True
         system_llvm = True
 
@@ -105,11 +121,12 @@ def llvm_register_toolchains():
         # symlinked path from the wrapper.
         wrapper_bin_prefix = "bin/"
         tools_path_prefix = "bin/"
-        for tool_name in _toolchain_tools:
-            rctx.symlink(llvm_dist_rel_path + "bin/" + tool_name, tools_path_prefix + tool_name)
+        tools = _toolchain_tools(os)
+        for tool_name, symlink_name in tools.items():
+            rctx.symlink(llvm_dist_rel_path + "bin/" + tool_name, tools_path_prefix + symlink_name)
         symlinked_tools_str = "".join([
-            "\n" + (" " * 8) + "\"" + tools_path_prefix + name + "\","
-            for name in _toolchain_tools
+            "\n" + (" " * 8) + "\"" + tools_path_prefix + symlink_name + "\","
+            for symlink_name in tools.values()
         ])
     else:
         llvm_dist_rel_path = llvm_dist_path_prefix
@@ -142,8 +159,10 @@ def llvm_register_toolchains():
         stdlib_dict = rctx.attr.stdlib,
         cxx_standard_dict = rctx.attr.cxx_standard,
         compile_flags_dict = rctx.attr.compile_flags,
+        conly_flags_dict = rctx.attr.conly_flags,
         cxx_flags_dict = rctx.attr.cxx_flags,
         link_flags_dict = rctx.attr.link_flags,
+        archive_flags_dict = rctx.attr.archive_flags,
         link_libs_dict = rctx.attr.link_libs,
         opt_compile_flags_dict = rctx.attr.opt_compile_flags,
         opt_link_flags_dict = rctx.attr.opt_link_flags,
@@ -152,23 +171,16 @@ def llvm_register_toolchains():
         coverage_link_flags_dict = rctx.attr.coverage_link_flags,
         unfiltered_compile_flags_dict = rctx.attr.unfiltered_compile_flags,
         llvm_version = llvm_version,
+        extra_compiler_files = rctx.attr.extra_compiler_files,
+        extra_exec_compatible_with = rctx.attr.extra_exec_compatible_with,
+        extra_target_compatible_with = rctx.attr.extra_target_compatible_with,
     )
-    host_dl_ext = "dylib" if os == "darwin" else "so"
-    host_tools_info = dict([
-        pair
-        for (key, tool_path) in [
-            # This is used when lld doesn't support the target platform (i.e.
-            # Mach-O for macOS):
-            ("ld", "/usr/bin/ld"),
-        ]
-        for pair in _host_tools.get_tool_info(rctx, tool_path, key).items()
-    ])
+    exec_dl_ext = "dylib" if os == "darwin" else "so"
     cc_toolchains_str, toolchain_labels_str = _cc_toolchains_str(
         rctx,
         workspace_name,
         toolchain_info,
         use_absolute_paths_llvm,
-        host_tools_info,
     )
 
     convenience_targets_str = _convenience_targets_str(
@@ -176,7 +188,7 @@ def llvm_register_toolchains():
         use_absolute_paths_llvm,
         llvm_dist_rel_path,
         llvm_dist_label_prefix,
-        host_dl_ext,
+        exec_dl_ext,
     )
 
     # Convenience macro to register all generated toolchains.
@@ -218,8 +230,7 @@ def _cc_toolchains_str(
         rctx,
         workspace_name,
         toolchain_info,
-        use_absolute_paths_llvm,
-        host_tools_info):
+        use_absolute_paths_llvm):
     # Since all the toolchains rely on downloading the right LLVM toolchain for
     # the host architecture, we don't need to explicitly specify
     # `exec_compatible_with` attribute. If the host and execution platform are
@@ -236,7 +247,10 @@ def _cc_toolchains_str(
     cc_toolchains_str = ""
     toolchain_names = []
     for (target_os, target_arch) in _supported_targets:
-        suffix = "{}-{}".format(target_arch, target_os)
+        if _is_standalone_arch(target_os, target_arch):
+            suffix = target_arch
+        else:
+            suffix = "{}-{}".format(target_arch, target_os)
         cc_toolchain_str = _cc_toolchain_str(
             rctx,
             suffix,
@@ -244,7 +258,6 @@ def _cc_toolchains_str(
             target_arch,
             toolchain_info,
             use_absolute_paths_llvm,
-            host_tools_info,
         )
         if cc_toolchain_str:
             cc_toolchains_str = cc_toolchains_str + cc_toolchain_str
@@ -267,12 +280,11 @@ def _cc_toolchain_str(
         target_os,
         target_arch,
         toolchain_info,
-        use_absolute_paths_llvm,
-        host_tools_info):
-    host_os = toolchain_info.os
-    host_arch = toolchain_info.arch
+        use_absolute_paths_llvm):
+    exec_os = toolchain_info.os
+    exec_arch = toolchain_info.arch
 
-    host_os_bzl = _os_bzl(host_os)
+    exec_os_bzl = _os_bzl(exec_os)
     target_os_bzl = _os_bzl(target_os)
 
     target_pair = _os_arch_pair(target_os, target_arch)
@@ -285,9 +297,9 @@ def _cc_toolchain_str(
         sysroot_label_str = ""
 
     if not sysroot_path:
-        if host_os == target_os and host_arch == target_arch:
+        if exec_os == target_os and exec_arch == target_arch:
             # For darwin -> darwin, we can use the macOS SDK path.
-            sysroot_path = _default_sysroot_path(rctx, host_os)
+            sysroot_path = _default_sysroot_path(rctx, exec_os)
         else:
             # We are trying to cross-compile without a sysroot, let's bail.
             # TODO: Are there situations where we can continue?
@@ -295,30 +307,81 @@ def _cc_toolchain_str(
 
     extra_files_str = "\":internal-use-files\""
 
-    # `struct` isn't allowed in `BUILD` files so we JSON encode + decode to turn
-    # them into `dict`s.
-    host_tools_info = json.decode(json.encode(host_tools_info))
+    # C++ built-in include directories.
+    # This contains both the includes shipped with the compiler as well as the sysroot (or host)
+    # include directories. While Bazel's default undeclared inclusions check does not seem to be
+    # triggered by header files under the execroot, we still include those paths here as they are
+    # visible via the "built_in_include_directories" attribute of CcToolchainInfo as well as to keep
+    # them in sync with the directories included in the system module map generated for the stricter
+    # "layering_check" feature.
+    toolchain_path_prefix = "%workspace%/" + toolchain_info.llvm_dist_path_prefix
+    llvm_version = toolchain_info.llvm_version
+    major_llvm_version = int(llvm_version.split(".")[0])
+    target_system_name = {
+        "darwin-x86_64": "x86_64-apple-macosx",
+        "darwin-aarch64": "aarch64-apple-macosx",
+        "linux-aarch64": "aarch64-unknown-linux-gnu",
+        "linux-x86_64": "x86_64-unknown-linux-gnu",
+        "wasm32": "wasm32-unknown-unknown",
+        "wasm64": "wasm64-unknown-unknown",
+    }[target_pair]
+    cxx_builtin_include_directories = [
+        toolchain_path_prefix + "include/c++/v1",
+        toolchain_path_prefix + "include/{}/c++/v1".format(target_system_name),
+        toolchain_path_prefix + "lib/clang/{}/include".format(llvm_version),
+        toolchain_path_prefix + "lib/clang/{}/share".format(llvm_version),
+        toolchain_path_prefix + "lib64/clang/{}/include".format(llvm_version),
+        toolchain_path_prefix + "lib/clang/{}/include".format(major_llvm_version),
+        toolchain_path_prefix + "lib/clang/{}/share".format(major_llvm_version),
+        toolchain_path_prefix + "lib64/clang/{}/include".format(major_llvm_version),
+    ]
+
+    sysroot_prefix = ""
+    if sysroot_path:
+        sysroot_prefix = "%sysroot%"
+    if target_os == "linux":
+        cxx_builtin_include_directories.extend([
+            _join(sysroot_prefix, "/include"),
+            _join(sysroot_prefix, "/usr/include"),
+            _join(sysroot_prefix, "/usr/local/include"),
+        ])
+    elif target_os == "darwin":
+        cxx_builtin_include_directories.extend([
+            _join(sysroot_prefix, "/usr/include"),
+            _join(sysroot_prefix, "/System/Library/Frameworks"),
+        ])
+    elif target_os == "none":
+        if sysroot_prefix:
+            cxx_builtin_include_directories.extend([
+                _join(sysroot_prefix, "/include"),
+            ])
+    else:
+        fail("Unreachable")
+
+    cxx_builtin_include_directories.extend(toolchain_info.additional_include_dirs_dict.get(target_pair, []))
 
     template = """
 # CC toolchain for cc-clang-{suffix}.
 
 cc_toolchain_config(
     name = "local-{suffix}",
-    host_arch = "{host_arch}",
-    host_os = "{host_os}",
+    exec_arch = "{exec_arch}",
+    exec_os = "{exec_os}",
     target_arch = "{target_arch}",
     target_os = "{target_os}",
+    target_system_name = "{target_system_name}",
     toolchain_path_prefix = "{llvm_dist_path_prefix}",
     tools_path_prefix = "{tools_path_prefix}",
     wrapper_bin_prefix = "{wrapper_bin_prefix}",
     compiler_configuration = {{
-      "additional_include_dirs": {additional_include_dirs},
       "sysroot_path": "{sysroot_path}",
       "stdlib": "{stdlib}",
       "cxx_standard": "{cxx_standard}",
       "compile_flags": {compile_flags},
+      "conly_flags": {conly_flags},
       "cxx_flags": {cxx_flags},
       "link_flags": {link_flags},
+      "archive_flags": {archive_flags},
       "link_libs": {link_libs},
       "opt_compile_flags": {opt_compile_flags},
       "opt_link_flags": {opt_link_flags},
@@ -327,20 +390,20 @@ cc_toolchain_config(
       "coverage_link_flags": {coverage_link_flags},
       "unfiltered_compile_flags": {unfiltered_compile_flags},
     }},
-    llvm_version = "{llvm_version}",
-    host_tools_info = {host_tools_info},
+    cxx_builtin_include_directories = {cxx_builtin_include_directories},
+    major_llvm_version = {major_llvm_version},
 )
 
 toolchain(
     name = "cc-toolchain-{suffix}",
     exec_compatible_with = [
-        "@platforms//cpu:{host_arch}",
-        "@platforms//os:{host_os_bzl}",
-    ],
+        "@platforms//cpu:{exec_arch}",
+        "@platforms//os:{exec_os_bzl}",
+    ] + {extra_exec_compatible_with_specific} + {extra_exec_compatible_with_all_targets},
     target_compatible_with = [
         "@platforms//cpu:{target_arch}",
         "@platforms//os:{target_os_bzl}",
-    ],
+    ] + {extra_target_compatible_with_specific} + {extra_target_compatible_with_all_targets},
     target_settings = {target_settings},
     toolchain = ":cc-clang-{suffix}",
     toolchain_type = "@bazel_tools//tools/cpp:toolchain_type",
@@ -358,7 +421,10 @@ filegroup(
         template = template + """
 filegroup(
     name = "compiler-components-{suffix}",
-    srcs = [":sysroot-components-{suffix}"],
+    srcs = [
+        ":sysroot-components-{suffix}",
+        {extra_compiler_files}
+    ],
 )
 
 filegroup(
@@ -391,6 +457,7 @@ filegroup(
         "{llvm_dist_label_prefix}clang",
         "{llvm_dist_label_prefix}include",
         ":sysroot-components-{suffix}",
+        {extra_compiler_files}
     ],
 )
 
@@ -425,6 +492,21 @@ filegroup(name = "strip-files-{suffix}", srcs = ["{llvm_dist_label_prefix}strip"
 """
 
     template = template + """
+filegroup(
+    name = "include-components-{suffix}",
+    srcs = [
+        ":compiler-components-{suffix}",
+        ":sysroot-components-{suffix}",
+    ],
+)
+
+system_module_map(
+    name = "module-{suffix}",
+    cxx_builtin_include_files = ":include-components-{suffix}",
+    cxx_builtin_include_directories = {cxx_builtin_include_directories},
+    sysroot_path = "{sysroot_path}",
+)
+
 cc_toolchain(
     name = "cc-clang-{suffix}",
     all_files = "all-files-{suffix}",
@@ -436,30 +518,43 @@ cc_toolchain(
     objcopy_files = "objcopy-files-{suffix}",
     strip_files = "strip-files-{suffix}",
     toolchain_config = "local-{suffix}",
+    module_map = "module-{suffix}",
 )
 """
+
+    # Filter out non-existing directories with absolute paths as they
+    # result in a -Wincomplete-umbrella warning when mentioned in the
+    # system module map. Note that this filtering is skipped for remote
+    # execution because it is not possible to check directory existence.
+    filtered_cxx_builtin_include_directories = cxx_builtin_include_directories if _is_remote(rctx, exec_os, exec_arch) else [
+        dir
+        for dir in cxx_builtin_include_directories
+        if _is_hermetic_or_exists(rctx, dir, sysroot_path)
+    ]
 
     return template.format(
         suffix = suffix,
         target_os = target_os,
         target_arch = target_arch,
-        host_os = host_os,
-        host_arch = host_arch,
+        exec_os = exec_os,
+        exec_arch = exec_arch,
         target_settings = _list_to_string(_dict_value(toolchain_info.target_settings_dict, target_pair)),
         target_os_bzl = target_os_bzl,
-        host_os_bzl = host_os_bzl,
+        target_system_name = target_system_name,
+        exec_os_bzl = exec_os_bzl,
         llvm_dist_label_prefix = toolchain_info.llvm_dist_label_prefix,
         llvm_dist_path_prefix = toolchain_info.llvm_dist_path_prefix,
         tools_path_prefix = toolchain_info.tools_path_prefix,
         wrapper_bin_prefix = toolchain_info.wrapper_bin_prefix,
         sysroot_label_str = sysroot_label_str,
         sysroot_path = sysroot_path,
-        additional_include_dirs = _list_to_string(toolchain_info.additional_include_dirs_dict.get(target_pair, [])),
         stdlib = _dict_value(toolchain_info.stdlib_dict, target_pair, "builtin-libc++"),
         cxx_standard = _dict_value(toolchain_info.cxx_standard_dict, target_pair, "c++17"),
         compile_flags = _list_to_string(_dict_value(toolchain_info.compile_flags_dict, target_pair)),
+        conly_flags = _list_to_string(toolchain_info.conly_flags_dict.get(target_pair, [])),
         cxx_flags = _list_to_string(_dict_value(toolchain_info.cxx_flags_dict, target_pair)),
         link_flags = _list_to_string(_dict_value(toolchain_info.link_flags_dict, target_pair)),
+        archive_flags = _list_to_string(_dict_value(toolchain_info.archive_flags_dict, target_pair)),
         link_libs = _list_to_string(_dict_value(toolchain_info.link_libs_dict, target_pair)),
         opt_compile_flags = _list_to_string(_dict_value(toolchain_info.opt_compile_flags_dict, target_pair)),
         opt_link_flags = _list_to_string(_dict_value(toolchain_info.opt_link_flags_dict, target_pair)),
@@ -467,17 +562,25 @@ cc_toolchain(
         coverage_compile_flags = _list_to_string(_dict_value(toolchain_info.coverage_compile_flags_dict, target_pair)),
         coverage_link_flags = _list_to_string(_dict_value(toolchain_info.coverage_link_flags_dict, target_pair)),
         unfiltered_compile_flags = _list_to_string(_dict_value(toolchain_info.unfiltered_compile_flags_dict, target_pair)),
-        llvm_version = toolchain_info.llvm_version,
         extra_files_str = extra_files_str,
-        host_tools_info = host_tools_info,
+        cxx_builtin_include_directories = _list_to_string(filtered_cxx_builtin_include_directories),
+        extra_compiler_files = ("\"%s\"," % str(toolchain_info.extra_compiler_files)) if toolchain_info.extra_compiler_files else "",
+        major_llvm_version = major_llvm_version,
+        extra_exec_compatible_with_specific = toolchain_info.extra_exec_compatible_with.get(target_pair, []),
+        extra_target_compatible_with_specific = toolchain_info.extra_target_compatible_with.get(target_pair, []),
+        extra_exec_compatible_with_all_targets = toolchain_info.extra_exec_compatible_with.get("", []),
+        extra_target_compatible_with_all_targets = toolchain_info.extra_target_compatible_with.get("", []),
     )
 
-def _convenience_targets_str(rctx, use_absolute_paths, llvm_dist_rel_path, llvm_dist_label_prefix, host_dl_ext):
+def _is_remote(rctx, exec_os, exec_arch):
+    return not (_os_from_rctx(rctx) == exec_os and _arch_from_rctx(rctx) == exec_arch)
+
+def _convenience_targets_str(rctx, use_absolute_paths, llvm_dist_rel_path, llvm_dist_label_prefix, exec_dl_ext):
     if use_absolute_paths:
         llvm_dist_label_prefix = ":"
         filenames = []
         for libname in _aliased_libs:
-            filename = "lib/{}.{}".format(libname, host_dl_ext)
+            filename = "lib/{}.{}".format(libname, exec_dl_ext)
             filenames.append(filename)
         for toolname in _aliased_tools:
             filename = "bin/{}".format(toolname)
@@ -491,7 +594,7 @@ def _convenience_targets_str(rctx, use_absolute_paths, llvm_dist_rel_path, llvm_
         template = """
 cc_import(
     name = "{name}",
-    shared_library = "{{llvm_dist_label_prefix}}lib/lib{name}.{{host_dl_ext}}",
+    shared_library = "{{llvm_dist_label_prefix}}lib/lib{name}.{{exec_dl_ext}}",
 )""".format(name = name)
         lib_target_strs.append(template)
 
@@ -507,5 +610,11 @@ native_binary(
 
     return "\n".join(lib_target_strs + tool_target_strs).format(
         llvm_dist_label_prefix = llvm_dist_label_prefix,
-        host_dl_ext = host_dl_ext,
+        exec_dl_ext = exec_dl_ext,
     )
+
+def _is_hermetic_or_exists(rctx, path, sysroot_path):
+    path = path.replace("%sysroot%", sysroot_path).replace("//", "/")
+    if not path.startswith("/"):
+        return True
+    return rctx.path(path).exists
